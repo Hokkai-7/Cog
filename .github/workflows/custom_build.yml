@@ -12,16 +12,32 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Patch Playlist UI for Album Art
+      - name: Select Latest Xcode (for Liquid Glass UI)
+        run: |
+          if [ -d "/Applications/Xcode_26.3.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+          fi
+          xcodebuild -version
+
+      - name: Strip Author Signing & Patch Playlist UI
         run: |
           python3 - << 'EOF'
           import glob, re
 
-          # 1. Делаем высоту строки 44 пикселя в PlaylistView.m
+          # 1. Убираем привязку к сертификату автора во всех проектах, чтобы билд не падал на 9-й минуте
+          for pbx in glob.glob('**/*.pbxproj', recursive=True):
+              with open(pbx, 'r', encoding='utf-8', errors='ignore') as f:
+                  c = f.read()
+              c = re.sub(r'DEVELOPMENT_TEAM = [^;]+;', 'DEVELOPMENT_TEAM = "";', c)
+              c = re.sub(r'CODE_SIGN_STYLE = Automatic;', 'CODE_SIGN_STYLE = Manual;', c)
+              c = re.sub(r'PROVISIONING_PROFILE_SPECIFIER = [^;]+;', 'PROVISIONING_PROFILE_SPECIFIER = "";', c)
+              with open(pbx, 'w', encoding='utf-8') as f:
+                  f.write(c)
+
+          # 2. Делаем высоту строки 44 пикселя в PlaylistView.m
           for path in glob.glob('**/PlaylistView.m', recursive=True):
               with open(path, 'r', encoding='utf-8') as f:
                   content = f.read()
-
               if 'awakeFromNib' in content and 'setRowHeight:44.0' not in content:
                   content = re.sub(
                       r'(- \(void\)awakeFromNib\s*\{)',
@@ -31,7 +47,7 @@ jobs:
               with open(path, 'w', encoding='utf-8') as f:
                   f.write(content)
 
-          # 2. Внедряем обложку 36x36 слева от названия трека (Title) в PlaylistController.m
+          # 3. Безопасно внедряем обложку 36x36 слева от названия трека (Title) в PlaylistController.m
           for path in glob.glob('**/PlaylistController.m', recursive=True):
               with open(path, 'r', encoding='utf-8') as f:
                   content = f.read()
@@ -41,8 +57,10 @@ jobs:
               if (!cell || row < 0 || row >= [[self arrangedObjects] count]) return;
               id entry = [[self arrangedObjects] objectAtIndex:row];
               NSImage *art = nil;
-              if ([entry respondsToSelector:@selector(albumArt)]) {
-                  art = [entry performSelector:@selector(albumArt)];
+              @try {
+                  art = [entry valueForKey:@"albumArt"];
+              } @catch (NSException *exception) {
+                  art = nil;
               }
               NSImageView *imgView = [cell viewWithTag:9991];
               if (!imgView) {
@@ -79,12 +97,6 @@ jobs:
           '''
 
               if 'applyCustomCoverToCell' not in content and '@implementation PlaylistController' in content:
-                  # Если в файле уже есть viewForTableColumn, встраиваемся и в него тоже
-                  if 'viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row' in content:
-                      content = content.replace(
-                          'return cellView;',
-                          'if ([[tableColumn identifier] isEqualToString:@"title"]) { [tableView setRowHeight:44.0]; [self applyCustomCoverToCell:cellView forRow:row]; }\n    return cellView;'
-                      )
                   content = content.replace(
                       '@implementation PlaylistController',
                       '@implementation PlaylistController\n' + helper_method
@@ -93,29 +105,36 @@ jobs:
               with open(path, 'w', encoding='utf-8') as f:
                   f.write(content)
 
-          print("Patch applied successfully!")
+          print("Project signing stripped and UI patch applied!")
           EOF
 
-      - name: Build Cog.app via Xcode
+      - name: Build Cog.app via Xcode (Quiet Mode)
         run: |
-          set -e
+          set -o pipefail
           xcodebuild -project Cog.xcodeproj \
             -scheme "Cog" \
             -configuration Release \
             -derivedDataPath "$(pwd)/DerivedData" \
+            -quiet \
             CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
             DEVELOPMENT_TEAM="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            ENABLE_APP_SANDBOX=NO \
+            REGISTER_APP_GROUPS=NO \
             ARCHS="arm64" \
             ONLY_ACTIVE_ARCH=YES \
-            build
+            build 2>&1 | tee build_errors.log
 
-      - name: Locate Built App
+      - name: Locate Built App and Re-Sign Locally
         run: |
           mkdir -p ReadyApp
           APP_PATH=$(find "$(pwd)/DerivedData/Build/Products" -name "Cog.app" -type d | head -n 1)
           echo "Found app at: $APP_PATH"
-          cp -R "$APP_PATH" ReadyApp/
+          cp -R "$APP_PATH" ReadyApp/Cog.app
+          codesign --force --deep --sign - ReadyApp/Cog.app
 
       - name: Upload Ready App
         uses: actions/upload-artifact@v4
