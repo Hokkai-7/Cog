@@ -12,24 +12,33 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Clean Project & Patch Playlist UI
+      - name: Fix SVG Template 7.0, Clean Signing & Patch Playlist UI
         run: |
           python3 - << 'EOF'
-          import glob, re
+          import glob, os, re
 
-          # 1. Вырезаем привязку к сертификатам автора и отключаем скрипт загрузки в Sentry, который валит билд в конце
+          # 1. Исправляем баг Xcode 16.4 с SVG
+          for svg in glob.glob('**/*.svg', recursive=True):
+              with open(svg, 'r', encoding='utf-8', errors='ignore') as f:
+                  s = f.read()
+              if '7.0' in s:
+                  s = s.replace('7.0', '6.0')
+                  with open(svg, 'w', encoding='utf-8') as f:
+                      f.write(s)
+
+          # 2. Очищаем подписи автора и отключаем Sentry
           for pbx in glob.glob('**/*.pbxproj', recursive=True):
               with open(pbx, 'r', encoding='utf-8', errors='ignore') as f:
                   c = f.read()
               c = re.sub(r'DEVELOPMENT_TEAM = [^;]+;', 'DEVELOPMENT_TEAM = "";', c)
               c = re.sub(r'CODE_SIGN_STYLE = Automatic;', 'CODE_SIGN_STYLE = Manual;', c)
+              c = re.sub(r'CODE_SIGN_IDENTITY = "[^"]+";', 'CODE_SIGN_IDENTITY = "-";', c)
+              c = re.sub(r'"CODE_SIGN_IDENTITY\[sdk=macosx\*\]" = "[^"]+";', '"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";', c)
               c = re.sub(r'PROVISIONING_PROFILE_SPECIFIER = [^;]+;', 'PROVISIONING_PROFILE_SPECIFIER = "";', c)
-              # Обезвреживаем внешние shell-скрипты Sentry в проекте Cog
               c = c.replace('sentry-cli', 'true || sentry-cli')
               with open(pbx, 'w', encoding='utf-8') as f:
                   f.write(c)
 
-          # Обезвреживаем любые внешние скрипты в папке Scripts, чтобы они не падали с ошибкой
           for sh in glob.glob('Scripts/*.sh'):
               with open(sh, 'r', encoding='utf-8', errors='ignore') as f:
                   sc = f.read()
@@ -37,7 +46,21 @@ jobs:
                   with open(sh, 'w', encoding='utf-8') as f:
                       f.write('#!/bin/sh\nexit 0\n')
 
-          # 2. Делаем высоту строки 44 пикселя в PlaylistView.m
+          # 3. Умный поиск свойства обложки
+          art_selector = "albumArt"  # Дефолт
+          for pe in glob.glob('**/PlaylistEntry.h', recursive=True):
+              with open(pe, 'r', encoding='utf-8', errors='ignore') as f:
+                  peh = f.read()
+              # Если в Cog свойство называется по-другому (например, просто image или cover)
+              if 'albumArt' not in peh:
+                  match = re.search(r'\(\s*readonly\s*,\s*colis\s*\)\s*NSImage\s*\*\s*([a-zA-Z0-9_]+)', peh)
+                  if match:
+                      art_selector = match.group(1)
+                  elif 'image' in peh.lower():
+                      art_selector = 'image'
+          print(f"Using art selector: {art_selector}")
+
+          # 4. Увеличиваем высоту строк
           for path in glob.glob('**/PlaylistView.m', recursive=True):
               with open(path, 'r', encoding='utf-8') as f:
                   content = f.read()
@@ -50,106 +73,123 @@ jobs:
               with open(path, 'w', encoding='utf-8') as f:
                   f.write(content)
 
-          # 3. Внедряем обложку 36x36 слева от названия трека (Title) в PlaylistController.m
-          for path in glob.glob('**/PlaylistController.m', recursive=True):
+          # 5. Патчим PlaylistCellView.m с динамическим объявлением скрытого метода
+          for path in glob.glob('**/PlaylistCellView.m', recursive=True):
               with open(path, 'r', encoding='utf-8') as f:
                   content = f.read()
 
-              helper_method = r'''
-          - (void)applyCustomCoverToCell:(NSView *)cell forRow:(NSInteger)row {
-              if (!cell || row < 0 || row >= [[self arrangedObjects] count]) return;
-              id entry = [[self arrangedObjects] objectAtIndex:row];
-              NSImage *art = nil;
-              @try {
-                  art = [entry valueForKey:@"albumArt"];
-              } @catch (NSException *exception) {
-                  art = nil;
+              cell_hook = r'''
+          - (void)layout {
+              #ifdef HAS_ORIG_LAYOUT
+              [self orig_layout];
+              #else
+              [super layout];
+              #endif
+              
+              NSTableView *tv = nil;
+              NSView *sv = [self superview];
+              while (sv && ![sv isKindOfClass:[NSTableView class]]) {
+                  sv = [sv superview];
               }
-              NSImageView *imgView = [cell viewWithTag:9991];
-              if (!imgView) {
-                  imgView = [[NSImageView alloc] initWithFrame:NSMakeRect(4, 4, 36, 36)];
-                  [imgView setTag:9991];
-                  [imgView setWantsLayer:YES];
-                  imgView.layer.cornerRadius = 6.0;
-                  imgView.layer.masksToBounds = YES;
-                  [imgView setImageScaling:NSImageScaleProportionallyUpOrDown];
-                  [cell addSubview:imgView];
+              if ([sv isKindOfClass:[NSTableView class]]) {
+                  tv = (NSTableView *)sv;
+                  if ([tv rowHeight] < 44.0) {
+                      [tv setRowHeight:44.0];
+                  }
+              }
 
-                  for (NSView *sub in [cell subviews]) {
-                      if ([sub isKindOfClass:[NSTextField class]]) {
-                          NSRect tfFrame = [sub frame];
-                          if (tfFrame.origin.x < 40) {
-                              tfFrame.origin.x = 46;
-                              tfFrame.size.width = MAX(50, cell.frame.size.width - 50);
-                              [sub setFrame:tfFrame];
+              NSString *colId = [[self identifier] lowercaseString];
+              if ([colId isEqualToString:@"title"] || [[self superview] isKindOfClass:[NSTableRowView class]]) {
+                  if (tv) {
+                      NSInteger colIdx = [tv columnForView:self];
+                      if (colIdx != -1) {
+                          NSTableColumn *col = [[tv tableColumns] objectAtIndex:colIdx];
+                          if (![[[col identifier] lowercaseString] isEqualToString:@"title"]) {
+                              return;
                           }
                       }
                   }
-              }
-              [imgView setImage:art];
-          }
 
-          - (void)tableView:(NSTableView *)tableView didAddRowView:(NSTableRowView *)rowView forRow:(NSInteger)row {
-              [tableView setRowHeight:44.0];
-              NSInteger titleCol = [tableView columnWithIdentifier:@"title"];
-              if (titleCol != -1) {
-                  NSView *cell = [rowView viewAtColumn:titleCol];
-                  [self applyCustomCoverToCell:cell forRow:row];
+                  id entry = [self objectValue];
+                  NSImage *art = nil;
+                  if (entry) {
+                      @try {
+                          art = [entry valueForKey:@"''' + art_selector + r'''"];
+                      } @catch (NSException *e) {
+                          art = nil;
+                      }
+                  }
+
+                  NSImageView *imgView = [self viewWithTag:9991];
+                  if (!imgView) {
+                      imgView = [[NSImageView alloc] initWithFrame:NSMakeRect(4, (self.bounds.size.height - 36.0) / 2.0, 36, 36)];
+                      [imgView setTag:9991];
+                      [imgView setImageScaling:NSImageScaleProportionallyUpOrDown];
+                      [self addSubview:imgView];
+                      
+                      // Настраиваем слой строго ПОСЛЕ addSubview, чтобы layer существовал
+                      [imgView setWantsLayer:YES];
+                      if (imgView.layer) {
+                          imgView.layer.cornerRadius = 6.0;
+                          imgView.layer.masksToBounds = YES;
+                      }
+                  } else {
+                      [imgView setFrame:NSMakeRect(4, (self.bounds.size.height - 36.0) / 2.0, 36, 36)];
+                  }
+                  [imgView setImage:art];
+
+                  if (self.textField) {
+                      NSRect tf = self.textField.frame;
+                      tf.origin.x = 46.0;
+                      tf.size.width = MAX(40.0, self.bounds.size.width - 50.0);
+                      [self.textField setFrame:tf];
+                  }
               }
           }
           '''
-
-              if 'applyCustomCoverToCell' not in content and '@implementation PlaylistController' in content:
+              if 'viewWithTag:9991' not in content:
+                  # Избегаем ошибки компилятора: внедряем категорию-объявление перед реализацией
+                  interface_patch = "\n@interface PlaylistCellView (CustomPatch)\n- (void)orig_layout;\n@end\n"
+                  
+                  if '- (void)layout' in content:
+                      content = content.replace('- (void)layout', '#define HAS_ORIG_LAYOUT 1\n- (void)orig_layout')
+                  
                   content = content.replace(
-                      '@implementation PlaylistController',
-                      '@implementation PlaylistController\n' + helper_method
+                      '@implementation PlaylistCellView',
+                      interface_patch + '\n@implementation PlaylistCellView\n' + cell_hook
                   )
-
-              with open(path, 'w', encoding='utf-8') as f:
-                  f.write(content)
-
-          print("Project cleaned and UI patch applied!")
+                  
+                  with open(path, 'w', encoding='utf-8') as f:
+                      f.write(content)
           EOF
+
 
       - name: Build Cog.app (Native Xcode 16.4)
         run: |
-          # Используем родной для macOS 15 Xcode 16.4, чтобы ibtoold не падал с ошибкой dyld CoreMedia
           sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
           xcodebuild -version
 
-          set +e
           xcodebuild -project Cog.xcodeproj \
             -scheme "Cog" \
             -configuration Release \
             -derivedDataPath "$(pwd)/DerivedData" \
             -quiet \
             CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
             DEVELOPMENT_TEAM="" \
-            CODE_SIGN_ENTITLEMENTS="" \
             ENABLE_APP_SANDBOX=NO \
             REGISTER_APP_GROUPS=NO \
             ARCHS="arm64" \
             ONLY_ACTIVE_ARCH=YES \
-            build 2>&1 | tee build_errors.log
-          
-          echo "=== CHECKING IF COG.APP WAS BUILT ==="
-          APP_PATH=$(find "$(pwd)/DerivedData/Build/Products" -name "Cog.app" -type d | head -n 1)
-          if [ -z "$APP_PATH" ]; then
-            echo "Cog.app not found! Printing actual errors from log:"
-            grep -E "error:|fatal error:|failed" build_errors.log || tail -n 100 build_errors.log
-            exit 1
-          else
-            echo "SUCCESS! Found built Cog.app at: $APP_PATH"
-          fi
+            build
 
       - name: Package & Sign App
         run: |
           mkdir -p ReadyApp
-          APP_PATH=$(find "$(pwd)/DerivedData/Build/Products" -name "Cog.app" -type d | head -n 1)
-          cp -R "$APP_PATH" ReadyApp/Cog.app
+          APP_PATH="$(pwd)/DerivedData/Build/Products/Release/Cog.app"
+          echo "Verifying binary inside $APP_PATH/Contents/MacOS/Cog..."
+          ls -la "$APP_PATH/Contents/MacOS/"
+          # Используем ditto вместо cp -R, чтобы не ломать симлинки фреймворков macOS!
+          ditto "$APP_PATH" ReadyApp/Cog.app
           codesign --force --deep --sign - ReadyApp/Cog.app
 
       - name: Upload Ready App
