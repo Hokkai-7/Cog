@@ -5,7 +5,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Checkout Cog with Submodules
         uses: actions/checkout@v4
@@ -17,33 +17,40 @@ jobs:
           python3 - << 'EOF'
           import glob, re
 
-          # Ищем контроллер плейлиста
-          files = glob.glob('**/PlaylistController.m', recursive=True) + glob.glob('**/PlaylistView.m', recursive=True)
-          for path in files:
+          # 1. Делаем высоту строки 44 пикселя и включаем перехват отрисовки ячейки в PlaylistView.m
+          pv_files = glob.glob('**/PlaylistView.m', recursive=True)
+          for path in pv_files:
               with open(path, 'r', encoding='utf-8') as f:
                   content = f.read()
 
-              # 1. Делаем строки высокими (44px) под обложки в awakeFromNib
               if 'awakeFromNib' in content and 'setRowHeight:44.0' not in content:
                   content = re.sub(
                       r'(- \(void\)awakeFromNib\s*\{)',
-                      r'\1\n    [self.tableView setRowHeight:44.0];\n    [playlistView setRowHeight:44.0];',
+                      r'\1\n    [self setRowHeight:44.0];',
                       content
                   )
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(content)
 
-              # 2. Перехватываем отрисовку ячейки Title и добавляем обложку слева
-              target = 'tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row'
-              if target in content and 'CustomArtTag' not in content:
-                  patch = """
-                  tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
-                      [tableView setRowHeight:44.0];
-                  """
-                  # Внедряем иконку обложки в ячейку Title
-                  inject_cell = """
-                  if ([[tableColumn identifier] isEqualToString:@"title"]) {
-                      PlaylistEntry *entry = [[self arrangedObjects] objectAtIndex:row];
-                      NSImage *art = [entry albumArt];
-                      NSImageView *imgView = [cellView viewWithTag:9991];
+          # 2. Внедряем обложку 36x36 слева от названия трека (Title) в PlaylistController.m
+          pc_files = glob.glob('**/PlaylistController.m', recursive=True)
+          for path in pc_files:
+              with open(path, 'r', encoding='utf-8') as f:
+                  content = f.read()
+
+              hook = r'''
+          - (void)tableView:(NSTableView *)tableView didAddRowView:(NSTableRowView *)rowView forRow:(NSInteger)row {
+              [tableView setRowHeight:44.0];
+              if (row < 0 || row >= [[self arrangedObjects] count]) return;
+              id entry = [[self arrangedObjects] objectAtIndex:row];
+              if (![entry respondsToSelector:@selector(albumArt)]) return;
+              NSImage *art = [entry performSelector:@selector(albumArt)];
+
+              NSInteger titleCol = [tableView columnWithIdentifier:@"title"];
+              if (titleCol != -1) {
+                  NSView *cell = [rowView viewAtColumn:titleCol];
+                  if (cell) {
+                      NSImageView *imgView = [cell viewWithTag:9991];
                       if (!imgView) {
                           imgView = [[NSImageView alloc] initWithFrame:NSMakeRect(4, 4, 36, 36)];
                           [imgView setTag:9991];
@@ -51,35 +58,73 @@ jobs:
                           imgView.layer.cornerRadius = 5.0;
                           imgView.layer.masksToBounds = YES;
                           [imgView setImageScaling:NSImageScaleProportionallyUpOrDown];
-                          [cellView addSubview:imgView];
-                          
-                          NSTextField *tf = [cellView textField];
-                          if (tf) {
-                              NSRect f = [tf frame];
-                              f.origin.x = 46;
-                              f.size.width -= 42;
-                              [tf setFrame:f];
+                          [cell addSubview:imgView];
+
+                          for (NSView *sub in [cell subviews]) {
+                              if ([sub isKindOfClass:[NSTextField class]]) {
+                                  NSRect tfFrame = [sub frame];
+                                  if (tfFrame.origin.x < 40) {
+                                      tfFrame.origin.x = 46;
+                                      tfFrame.size.width = MAX(50, cell.frame.size.width - 50);
+                                      [sub setFrame:tfFrame];
+                                  }
+                              }
                           }
                       }
                       [imgView setImage:art];
                   }
-                  """
-                  content = content.replace('return cellView;', inject_cell + '\nreturn cellView;')
+              }
+          }
+          '''
+              if 'viewWithTag:9991' not in content and '@implementation PlaylistController' in content:
+                  content = content.replace(
+                      '@implementation PlaylistController',
+                      '@implementation PlaylistController\n' + hook
+                  )
 
               with open(path, 'w', encoding='utf-8') as f:
                   f.write(content)
-          print("Patch applied!")
+
+          print("Patch applied successfully!")
           EOF
 
-      - name: Build Cog.app via Xcode
+      - name: Find Xcode Project and Build Cog
         run: |
-          xcodebuild -project Cog.xcodeproj -scheme Cog -configuration Release \
-            SYMROOT="$(pwd)/build" \
-            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
-            ARCHS="arm64" ONLY_ACTIVE_ARCH=NO
+          set -e
+          echo "Checking repository structure..."
+          xcodebuild -list
+          
+          # Автоматически выбираем workspace или project
+          if [ -d "Cog.xcworkspace" ]; then
+            TARGET_FLAG="-workspace Cog.xcworkspace"
+          else
+            PROJ=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
+            TARGET_FLAG="-project $PROJ"
+          fi
+
+          echo "Using target: $TARGET_FLAG"
+
+          xcodebuild $TARGET_FLAG \
+            -scheme "Cog" \
+            -configuration Release \
+            -derivedDataPath "$(pwd)/DerivedData" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ENABLE_HARDENED_RUNTIME=NO \
+            ARCHS="arm64" \
+            ONLY_ACTIVE_ARCH=YES \
+            build
+
+      - name: Locate Built App
+        run: |
+          mkdir -p ReadyApp
+          APP_PATH=$(find "$(pwd)/DerivedData" -name "Cog.app" -type d | head -n 1)
+          echo "Found app at: $APP_PATH"
+          cp -R "$APP_PATH" ReadyApp/
 
       - name: Upload Ready App
         uses: actions/upload-artifact@v4
         with:
           name: Cog-With-Covers-macOS
-          path: build/Release/Cog.app
+          path: ReadyApp/Cog.app
