@@ -17,9 +17,8 @@ jobs:
           python3 - << 'EOF'
           import glob, re
 
-          # 1. Делаем высоту строки 44 пикселя и включаем перехват отрисовки ячейки в PlaylistView.m
-          pv_files = glob.glob('**/PlaylistView.m', recursive=True)
-          for path in pv_files:
+          # 1. Делаем высоту строки 44 пикселя в PlaylistView.m
+          for path in glob.glob('**/PlaylistView.m', recursive=True):
               with open(path, 'r', encoding='utf-8') as f:
                   content = f.read()
 
@@ -33,53 +32,62 @@ jobs:
                   f.write(content)
 
           # 2. Внедряем обложку 36x36 слева от названия трека (Title) в PlaylistController.m
-          pc_files = glob.glob('**/PlaylistController.m', recursive=True)
-          for path in pc_files:
+          for path in glob.glob('**/PlaylistController.m', recursive=True):
               with open(path, 'r', encoding='utf-8') as f:
                   content = f.read()
 
-              hook = r'''
+              helper_method = r'''
+          - (void)applyCustomCoverToCell:(NSView *)cell forRow:(NSInteger)row {
+              if (!cell || row < 0 || row >= [[self arrangedObjects] count]) return;
+              id entry = [[self arrangedObjects] objectAtIndex:row];
+              NSImage *art = nil;
+              if ([entry respondsToSelector:@selector(albumArt)]) {
+                  art = [entry performSelector:@selector(albumArt)];
+              }
+              NSImageView *imgView = [cell viewWithTag:9991];
+              if (!imgView) {
+                  imgView = [[NSImageView alloc] initWithFrame:NSMakeRect(4, 4, 36, 36)];
+                  [imgView setTag:9991];
+                  [imgView setWantsLayer:YES];
+                  imgView.layer.cornerRadius = 6.0;
+                  imgView.layer.masksToBounds = YES;
+                  [imgView setImageScaling:NSImageScaleProportionallyUpOrDown];
+                  [cell addSubview:imgView];
+
+                  for (NSView *sub in [cell subviews]) {
+                      if ([sub isKindOfClass:[NSTextField class]]) {
+                          NSRect tfFrame = [sub frame];
+                          if (tfFrame.origin.x < 40) {
+                              tfFrame.origin.x = 46;
+                              tfFrame.size.width = MAX(50, cell.frame.size.width - 50);
+                              [sub setFrame:tfFrame];
+                          }
+                      }
+                  }
+              }
+              [imgView setImage:art];
+          }
+
           - (void)tableView:(NSTableView *)tableView didAddRowView:(NSTableRowView *)rowView forRow:(NSInteger)row {
               [tableView setRowHeight:44.0];
-              if (row < 0 || row >= [[self arrangedObjects] count]) return;
-              id entry = [[self arrangedObjects] objectAtIndex:row];
-              if (![entry respondsToSelector:@selector(albumArt)]) return;
-              NSImage *art = [entry performSelector:@selector(albumArt)];
-
               NSInteger titleCol = [tableView columnWithIdentifier:@"title"];
               if (titleCol != -1) {
                   NSView *cell = [rowView viewAtColumn:titleCol];
-                  if (cell) {
-                      NSImageView *imgView = [cell viewWithTag:9991];
-                      if (!imgView) {
-                          imgView = [[NSImageView alloc] initWithFrame:NSMakeRect(4, 4, 36, 36)];
-                          [imgView setTag:9991];
-                          [imgView setWantsLayer:YES];
-                          imgView.layer.cornerRadius = 5.0;
-                          imgView.layer.masksToBounds = YES;
-                          [imgView setImageScaling:NSImageScaleProportionallyUpOrDown];
-                          [cell addSubview:imgView];
-
-                          for (NSView *sub in [cell subviews]) {
-                              if ([sub isKindOfClass:[NSTextField class]]) {
-                                  NSRect tfFrame = [sub frame];
-                                  if (tfFrame.origin.x < 40) {
-                                      tfFrame.origin.x = 46;
-                                      tfFrame.size.width = MAX(50, cell.frame.size.width - 50);
-                                      [sub setFrame:tfFrame];
-                                  }
-                              }
-                          }
-                      }
-                      [imgView setImage:art];
-                  }
+                  [self applyCustomCoverToCell:cell forRow:row];
               }
           }
           '''
-              if 'viewWithTag:9991' not in content and '@implementation PlaylistController' in content:
+
+              if 'applyCustomCoverToCell' not in content and '@implementation PlaylistController' in content:
+                  # Если в файле уже есть viewForTableColumn, встраиваемся и в него тоже
+                  if 'viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row' in content:
+                      content = content.replace(
+                          'return cellView;',
+                          'if ([[tableColumn identifier] isEqualToString:@"title"]) { [tableView setRowHeight:44.0]; [self applyCustomCoverToCell:cellView forRow:row]; }\n    return cellView;'
+                      )
                   content = content.replace(
                       '@implementation PlaylistController',
-                      '@implementation PlaylistController\n' + hook
+                      '@implementation PlaylistController\n' + helper_method
                   )
 
               with open(path, 'w', encoding='utf-8') as f:
@@ -88,30 +96,16 @@ jobs:
           print("Patch applied successfully!")
           EOF
 
-      - name: Find Xcode Project and Build Cog
+      - name: Build Cog.app via Xcode
         run: |
           set -e
-          echo "Checking repository structure..."
-          xcodebuild -list
-          
-          # Автоматически выбираем workspace или project
-          if [ -d "Cog.xcworkspace" ]; then
-            TARGET_FLAG="-workspace Cog.xcworkspace"
-          else
-            PROJ=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
-            TARGET_FLAG="-project $PROJ"
-          fi
-
-          echo "Using target: $TARGET_FLAG"
-
-          xcodebuild $TARGET_FLAG \
+          xcodebuild -project Cog.xcodeproj \
             -scheme "Cog" \
             -configuration Release \
             -derivedDataPath "$(pwd)/DerivedData" \
             CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            ENABLE_HARDENED_RUNTIME=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            DEVELOPMENT_TEAM="" \
             ARCHS="arm64" \
             ONLY_ACTIVE_ARCH=YES \
             build
@@ -119,7 +113,7 @@ jobs:
       - name: Locate Built App
         run: |
           mkdir -p ReadyApp
-          APP_PATH=$(find "$(pwd)/DerivedData" -name "Cog.app" -type d | head -n 1)
+          APP_PATH=$(find "$(pwd)/DerivedData/Build/Products" -name "Cog.app" -type d | head -n 1)
           echo "Found app at: $APP_PATH"
           cp -R "$APP_PATH" ReadyApp/
 
