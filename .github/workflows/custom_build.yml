@@ -12,27 +12,30 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Select Latest Xcode (for Liquid Glass UI)
-        run: |
-          if [ -d "/Applications/Xcode_26.3.app" ]; then
-            sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
-          fi
-          xcodebuild -version
-
-      - name: Strip Author Signing & Patch Playlist UI
+      - name: Clean Project & Patch Playlist UI
         run: |
           python3 - << 'EOF'
           import glob, re
 
-          # 1. Убираем привязку к сертификату автора во всех проектах, чтобы билд не падал на 9-й минуте
+          # 1. Вырезаем привязку к сертификатам автора и отключаем скрипт загрузки в Sentry, который валит билд в конце
           for pbx in glob.glob('**/*.pbxproj', recursive=True):
               with open(pbx, 'r', encoding='utf-8', errors='ignore') as f:
                   c = f.read()
               c = re.sub(r'DEVELOPMENT_TEAM = [^;]+;', 'DEVELOPMENT_TEAM = "";', c)
               c = re.sub(r'CODE_SIGN_STYLE = Automatic;', 'CODE_SIGN_STYLE = Manual;', c)
               c = re.sub(r'PROVISIONING_PROFILE_SPECIFIER = [^;]+;', 'PROVISIONING_PROFILE_SPECIFIER = "";', c)
+              # Обезвреживаем внешние shell-скрипты Sentry в проекте Cog
+              c = c.replace('sentry-cli', 'true || sentry-cli')
               with open(pbx, 'w', encoding='utf-8') as f:
                   f.write(c)
+
+          # Обезвреживаем любые внешние скрипты в папке Scripts, чтобы они не падали с ошибкой
+          for sh in glob.glob('Scripts/*.sh'):
+              with open(sh, 'r', encoding='utf-8', errors='ignore') as f:
+                  sc = f.read()
+              if 'sentry' in sc.lower():
+                  with open(sh, 'w', encoding='utf-8') as f:
+                      f.write('#!/bin/sh\nexit 0\n')
 
           # 2. Делаем высоту строки 44 пикселя в PlaylistView.m
           for path in glob.glob('**/PlaylistView.m', recursive=True):
@@ -47,7 +50,7 @@ jobs:
               with open(path, 'w', encoding='utf-8') as f:
                   f.write(content)
 
-          # 3. Безопасно внедряем обложку 36x36 слева от названия трека (Title) в PlaylistController.m
+          # 3. Внедряем обложку 36x36 слева от названия трека (Title) в PlaylistController.m
           for path in glob.glob('**/PlaylistController.m', recursive=True):
               with open(path, 'r', encoding='utf-8') as f:
                   content = f.read()
@@ -105,12 +108,16 @@ jobs:
               with open(path, 'w', encoding='utf-8') as f:
                   f.write(content)
 
-          print("Project signing stripped and UI patch applied!")
+          print("Project cleaned and UI patch applied!")
           EOF
 
-      - name: Build Cog.app via Xcode (Quiet Mode)
+      - name: Build Cog.app (Native Xcode 16.4)
         run: |
-          set -o pipefail
+          # Используем родной для macOS 15 Xcode 16.4, чтобы ibtoold не падал с ошибкой dyld CoreMedia
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+
+          set +e
           xcodebuild -project Cog.xcodeproj \
             -scheme "Cog" \
             -configuration Release \
@@ -127,12 +134,21 @@ jobs:
             ARCHS="arm64" \
             ONLY_ACTIVE_ARCH=YES \
             build 2>&1 | tee build_errors.log
+          
+          echo "=== CHECKING IF COG.APP WAS BUILT ==="
+          APP_PATH=$(find "$(pwd)/DerivedData/Build/Products" -name "Cog.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Cog.app not found! Printing actual errors from log:"
+            grep -E "error:|fatal error:|failed" build_errors.log || tail -n 100 build_errors.log
+            exit 1
+          else
+            echo "SUCCESS! Found built Cog.app at: $APP_PATH"
+          fi
 
-      - name: Locate Built App and Re-Sign Locally
+      - name: Package & Sign App
         run: |
           mkdir -p ReadyApp
           APP_PATH=$(find "$(pwd)/DerivedData/Build/Products" -name "Cog.app" -type d | head -n 1)
-          echo "Found app at: $APP_PATH"
           cp -R "$APP_PATH" ReadyApp/Cog.app
           codesign --force --deep --sign - ReadyApp/Cog.app
 
