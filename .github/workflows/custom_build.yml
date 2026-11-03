@@ -1,0 +1,85 @@
+name: Build Custom Cog with Covers
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout Cog with Submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Patch Playlist UI for Album Art
+        run: |
+          python3 - << 'EOF'
+          import glob, re
+
+          # Ищем контроллер плейлиста
+          files = glob.glob('**/PlaylistController.m', recursive=True) + glob.glob('**/PlaylistView.m', recursive=True)
+          for path in files:
+              with open(path, 'r', encoding='utf-8') as f:
+                  content = f.read()
+
+              # 1. Делаем строки высокими (44px) под обложки в awakeFromNib
+              if 'awakeFromNib' in content and 'setRowHeight:44.0' not in content:
+                  content = re.sub(
+                      r'(- \(void\)awakeFromNib\s*\{)',
+                      r'\1\n    [self.tableView setRowHeight:44.0];\n    [playlistView setRowHeight:44.0];',
+                      content
+                  )
+
+              # 2. Перехватываем отрисовку ячейки Title и добавляем обложку слева
+              target = 'tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row'
+              if target in content and 'CustomArtTag' not in content:
+                  patch = """
+                  tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
+                      [tableView setRowHeight:44.0];
+                  """
+                  # Внедряем иконку обложки в ячейку Title
+                  inject_cell = """
+                  if ([[tableColumn identifier] isEqualToString:@"title"]) {
+                      PlaylistEntry *entry = [[self arrangedObjects] objectAtIndex:row];
+                      NSImage *art = [entry albumArt];
+                      NSImageView *imgView = [cellView viewWithTag:9991];
+                      if (!imgView) {
+                          imgView = [[NSImageView alloc] initWithFrame:NSMakeRect(4, 4, 36, 36)];
+                          [imgView setTag:9991];
+                          [imgView setWantsLayer:YES];
+                          imgView.layer.cornerRadius = 5.0;
+                          imgView.layer.masksToBounds = YES;
+                          [imgView setImageScaling:NSImageScaleProportionallyUpOrDown];
+                          [cellView addSubview:imgView];
+                          
+                          NSTextField *tf = [cellView textField];
+                          if (tf) {
+                              NSRect f = [tf frame];
+                              f.origin.x = 46;
+                              f.size.width -= 42;
+                              [tf setFrame:f];
+                          }
+                      }
+                      [imgView setImage:art];
+                  }
+                  """
+                  content = content.replace('return cellView;', inject_cell + '\nreturn cellView;')
+
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(content)
+          print("Patch applied!")
+          EOF
+
+      - name: Build Cog.app via Xcode
+        run: |
+          xcodebuild -project Cog.xcodeproj -scheme Cog -configuration Release \
+            SYMROOT="$(pwd)/build" \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            ARCHS="arm64" ONLY_ACTIVE_ARCH=NO
+
+      - name: Upload Ready App
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cog-With-Covers-macOS
+          path: build/Release/Cog.app
