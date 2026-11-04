@@ -51,16 +51,15 @@ jobs:
           for pe in glob.glob('**/PlaylistEntry.h', recursive=True):
               with open(pe, 'r', encoding='utf-8', errors='ignore') as f:
                   peh = f.read()
-              # Если в Cog свойство называется по-другому (например, просто image или cover)
               if 'albumArt' not in peh:
-                  match = re.search(r'\(\s*readonly\s*,\s*colis\s*\)\s*NSImage\s*\*\s*([a-zA-Z0-9_]+)', peh)
+                  match = re.search(r'\(\s*readonly\s*,\s*(?:copy|assign|retain|strong|nonatomic|nullable|\s|,)+\)\s*NSImage\s*\*\s*([a-zA-Z0-9_]+)', peh)
                   if match:
                       art_selector = match.group(1)
                   elif 'image' in peh.lower():
                       art_selector = 'image'
           print(f"Using art selector: {art_selector}")
 
-          # 4. Увеличиваем высоту строк
+          # 4. Увеличиваем высоту строк в плейлисте
           for path in glob.glob('**/PlaylistView.m', recursive=True):
               with open(path, 'r', encoding='utf-8') as f:
                   content = f.read()
@@ -127,7 +126,6 @@ jobs:
                       [imgView setImageScaling:NSImageScaleProportionallyUpOrDown];
                       [self addSubview:imgView];
                       
-                      // Настраиваем слой строго ПОСЛЕ addSubview, чтобы layer существовал
                       [imgView setWantsLayer:YES];
                       if (imgView.layer) {
                           imgView.layer.cornerRadius = 6.0;
@@ -139,6 +137,7 @@ jobs:
                   [imgView setImage:art];
 
                   if (self.textField) {
+                      [self.textField setTranslatesAutoresizingMaskIntoConstraints:YES];
                       NSRect tf = self.textField.frame;
                       tf.origin.x = 46.0;
                       tf.size.width = MAX(40.0, self.bounds.size.width - 50.0);
@@ -148,7 +147,6 @@ jobs:
           }
           '''
               if 'viewWithTag:9991' not in content:
-                  # Избегаем ошибки компилятора: внедряем категорию-объявление перед реализацией
                   interface_patch = "\n@interface PlaylistCellView (CustomPatch)\n- (void)orig_layout;\n@end\n"
                   
                   if '- (void)layout' in content:
@@ -162,7 +160,6 @@ jobs:
                   with open(path, 'w', encoding='utf-8') as f:
                       f.write(content)
           EOF
-
 
       - name: Build Cog.app (Native Xcode 16.4)
         run: |
@@ -180,15 +177,19 @@ jobs:
             REGISTER_APP_GROUPS=NO \
             ARCHS="arm64" \
             ONLY_ACTIVE_ARCH=YES \
+            SWIFT_VERSION=5 \
+            OTHER_SWIFT_FLAGS="-strict-concurrency=minimal" \
             build
 
       - name: Package & Sign App
         run: |
           mkdir -p ReadyApp
-          APP_PATH="$(pwd)/DerivedData/Build/Products/Release/Cog.app"
-          echo "Verifying binary inside $APP_PATH/Contents/MacOS/Cog..."
-          ls -la "$APP_PATH/Contents/MacOS/"
-          # Используем ditto вместо cp -R, чтобы не ломать симлинки фреймворков macOS!
+          APP_PATH=$(find "$(pwd)/DerivedData/Build/Products" -name "Cog.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: Cog.app was not found in build products!"
+            exit 1
+          fi
+          echo "SUCCESS! Copying app from: $APP_PATH"
           ditto "$APP_PATH" ReadyApp/Cog.app
           codesign --force --deep --sign - ReadyApp/Cog.app
 
